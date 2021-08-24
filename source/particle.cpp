@@ -19,6 +19,8 @@
 #include "particle.h"
 #include "levelset.h"
 #include "mantaio.h"
+#include "vortexpart.h"
+#include "turbulencepart.h"
 
 using namespace std;
 namespace Manta {
@@ -673,5 +675,362 @@ template class ParticleDataImpl<int>;
 template class ParticleDataImpl<Real>;
 template class ParticleDataImpl<Vec3>;
 
+//******************************************************************************
+// Implementation
+//******************************************************************************
 
+const int DELETE_PART = 20; // chunk size for compression
+
+void ParticleBase::addBuffered(const Vec3& pos, int flag) {
+	mNewBufferPos.push_back(pos);
+	mNewBufferFlag.push_back(flag);
+}
+   
+template<class S>
+void ParticleSystem<S>::clear() {
+	mDeleteChunk = mDeletes = 0;
+	this->resizeAll(0); // instead of mData.clear
+}
+
+template<class S>
+IndexInt ParticleSystem<S>::add(const S& data) {
+	mData.push_back(data); 
+	mDeleteChunk = mData.size() / DELETE_PART;
+	this->addAllPdata();
+	return mData.size()-1;
+}
+
+template<class S>
+inline void ParticleSystem<S>::kill(IndexInt idx) {
+	assertMsg(idx>=0 && idx<size(), "Index out of bounds");
+	mData[idx].flag |= PDELETE; 
+	if ( (++mDeletes > mDeleteChunk) && (mAllowCompress) ) compress(); 
+}
+
+template<class S>
+void ParticleSystem<S>::getPosPdata(ParticleDataImpl<Vec3>& target) const {
+	for(IndexInt i=0; i<(IndexInt)this->size(); ++i) {
+		target[i] = this->getPos(i);
+	}
+}
+template<class S>
+void ParticleSystem<S>::setPosPdata(const ParticleDataImpl<Vec3>& source) {
+	for(IndexInt i=0; i<(IndexInt)this->size(); ++i) {
+		this->setPos(i, source[i]);
+	}
+}
+
+template<class S>
+void ParticleSystem<S>::transformPositions( Vec3i dimOld, Vec3i dimNew )
+{
+	const Vec3 factor = calcGridSizeFactor( dimNew, dimOld );
+	for(IndexInt i=0; i<(IndexInt)this->size(); ++i) {
+		this->setPos(i, this->getPos(i) * factor );
+	}
+}
+
+// check for deletion/invalid position, otherwise return velocity
+KERNEL(pts) returns(std::vector<Vec3> u) template<class S>
+std::vector<Vec3> GridAdvectKernel(
+	std::vector<S>& p, const MACGrid& vel, const FlagGrid& flags, const Real dt,
+	const bool deleteInObstacle, const bool stopInObstacle, const bool skipNew,
+	const ParticleDataImpl<int> *ptype, const int exclude)
+{
+	if ((p[idx].flag & ParticleBase::PDELETE) || (ptype && ((*ptype)[idx] & exclude)) || (skipNew && (p[idx].flag & ParticleBase::PNEW))) {
+		u[idx] = 0.; return;
+	}
+	// special handling
+	if(deleteInObstacle || stopInObstacle) {
+		if (!flags.isInBounds(p[idx].pos, 1) || flags.isObstacle(p[idx].pos) ) {
+			if(stopInObstacle)
+				u[idx] = 0.;
+			// for simple tracer particles, its convenient to delete particles right away
+			// for other sim types, eg flip, we can try to fix positions later on
+			if(deleteInObstacle)
+				p[idx].flag |= ParticleBase::PDELETE;
+			return;
+		}
+	}
+	u[idx] = vel.getInterpolated(p[idx].pos) * dt;
+};
+
+// final check after advection to make sure particles haven't escaped
+// (similar to particle advection kernel)
+KERNEL(pts) template<class S>
+void KnDeleteInObstacle(std::vector<S>& p, const FlagGrid& flags) {
+	if (p[idx].flag & ParticleBase::PDELETE) return;
+	if (!flags.isInBounds(p[idx].pos,1) || flags.isObstacle(p[idx].pos)) {
+		p[idx].flag |= ParticleBase::PDELETE;
+	} 
+}
+
+// try to get closer to actual obstacle boundary
+static inline Vec3 bisectBacktracePos(const FlagGrid& flags, const Vec3& oldp, const Vec3& newp)
+{
+	Real s = 0.;
+	for(int i=1; i<5; ++i) {
+		Real ds = 1./(Real)(1<<i);
+		if (!flags.isObstacle( oldp*(1.-(s+ds)) + newp*(s+ds) )) {
+			s += ds;
+		}
+	}
+	return( oldp*(1.-(s)) + newp*(s) );
+}
+
+// at least make sure all particles are inside domain
+KERNEL(pts) template<class S>
+void KnClampPositions(
+	std::vector<S>& p, const FlagGrid& flags, ParticleDataImpl<Vec3> *posOld=NULL, bool stopInObstacle=true,
+	const ParticleDataImpl<int> *ptype=NULL, const int exclude=0)
+{
+	if (p[idx].flag & ParticleBase::PDELETE) return;
+	if (ptype && ((*ptype)[idx] & exclude)) {
+		if(posOld) p[idx].pos = (*posOld)[idx];
+		return;
+	}
+	if (!flags.isInBounds(p[idx].pos,0) ) {
+		p[idx].pos = clamp( p[idx].pos, Vec3(0.), toVec3(flags.getSize())-Vec3(1.) );
+	} 
+	if (stopInObstacle && (flags.isObstacle(p[idx].pos)) ) {
+		p[idx].pos = bisectBacktracePos(flags, (*posOld)[idx], p[idx].pos);
+	}
+}
+
+// advection plugin
+template<class S>
+void ParticleSystem<S>::advectInGrid(
+	const FlagGrid &flags, const MACGrid &vel, const int integrationMode,
+	const bool deleteInObstacle, const bool stopInObstacle, const bool skipNew,
+	const ParticleDataImpl<int> *ptype, const int exclude)
+{
+	// position clamp requires old positions, backup
+	ParticleDataImpl<Vec3> *posOld = NULL;
+	if(!deleteInObstacle) {
+		posOld = new ParticleDataImpl<Vec3>(this->getParent());
+		posOld->resize(mData.size());
+		for(IndexInt i=0; i<(IndexInt)mData.size();++i) (*posOld)[i] = mData[i].pos;
+	}
+
+	// update positions
+	GridAdvectKernel<S> kernel(mData, vel, flags, getParent()->getDt(), deleteInObstacle, stopInObstacle, skipNew, ptype, exclude);
+	integratePointSet(kernel, integrationMode);
+
+	if(!deleteInObstacle) {
+		KnClampPositions<S>  (mData, flags, posOld, stopInObstacle, ptype, exclude);
+		delete posOld;
+	} else {
+		KnDeleteInObstacle<S>(mData, flags);
+	}
+}
+
+KERNEL(pts, single) // no thread-safe random gen yet
+template<class S>
+void KnProjectParticles(ParticleSystem<S>& part, Grid<Vec3>& gradient) {
+	static RandomStream rand (3123984);
+	const double jlen = 0.1;
+	
+	if (part.isActive(idx)) {
+		// project along levelset gradient
+		Vec3 p = part[idx].pos;
+		if (gradient.isInBounds(p)) {
+			Vec3 n = gradient.getInterpolated(p);
+			Real dist = normalize(n);
+			Vec3 dx = n * (-dist + jlen * (1 + rand.getReal()));
+			p += dx;            
+		}
+		// clamp to outer boundaries (+jitter)
+		const double jlen = 0.1;
+		Vec3 jitter = jlen * rand.getVec3();
+		part[idx].pos = clamp(p, Vec3(1,1,1)+jitter, toVec3(gradient.getSize()-1)-jitter);
+	}
+}
+
+template<class S>
+void ParticleSystem<S>::projectOutside(Grid<Vec3> &gradient) {
+	KnProjectParticles<S>(*this, gradient);
+}
+
+KERNEL(pts) template<class S>
+void KnProjectOutOfBnd(ParticleSystem<S> &part, const FlagGrid &flags, const Real bnd, const bool *axis, const ParticleDataImpl<int> *ptype, const int exclude) {
+	if(!part.isActive(idx) || (ptype && ((*ptype)[idx] & exclude))) return;
+	if(axis[0]) part[idx].pos.x = std::max(part[idx].pos.x, bnd);
+	if(axis[1]) part[idx].pos.x = std::min(part[idx].pos.x, static_cast<Real>(flags.getSizeX())-bnd);
+	if(axis[2]) part[idx].pos.y = std::max(part[idx].pos.y, bnd);
+	if(axis[3]) part[idx].pos.y = std::min(part[idx].pos.y, static_cast<Real>(flags.getSizeY())-bnd);
+	if(flags.is3D()) {
+		if(axis[4]) part[idx].pos.z = std::max(part[idx].pos.z, bnd);
+		if(axis[5]) part[idx].pos.z = std::min(part[idx].pos.z, static_cast<Real>(flags.getSizeZ())-bnd);
+	}
+}
+
+template<class S>
+void ParticleSystem<S>::projectOutOfBnd(const FlagGrid &flags, const Real bnd, const std::string &plane, const ParticleDataImpl<int> *ptype, const int exclude) {
+	bool axis[6] = { false };
+	for(std::string::const_iterator it=plane.begin(); it!=plane.end(); ++it) {
+		if(*it=='x') axis[0] = true;
+		if(*it=='X') axis[1] = true;
+		if(*it=='y') axis[2] = true;
+		if(*it=='Y') axis[3] = true;
+		if(*it=='z') axis[4] = true;
+		if(*it=='Z') axis[5] = true;
+	}
+	KnProjectOutOfBnd<S>(*this, flags, bnd, axis, ptype, exclude);
+}
+
+template<class S>
+void ParticleSystem<S>::resizeAll(IndexInt size) {
+	// resize all buffers to target size in 1 go
+	mData.resize(size);
+	for(IndexInt i=0; i<(IndexInt)mPartData.size(); ++i)
+		mPartData[i]->resize(size);
+}
+
+template<class S>
+void ParticleSystem<S>::compress() {
+	IndexInt nextRead = mData.size();
+	for (IndexInt i=0; i<(IndexInt)mData.size(); i++) {
+		while ((mData[i].flag & PDELETE) != 0) {
+			nextRead--;
+			mData[i] = mData[nextRead];
+			// ugly, but prevent virtual function calls here:
+			for(IndexInt pd=0; pd<(IndexInt)mPdataReal.size(); ++pd) mPdataReal[pd]->copyValue(nextRead, i);
+			for(IndexInt pd=0; pd<(IndexInt)mPdataVec3.size(); ++pd) mPdataVec3[pd]->copyValue(nextRead, i);
+			for(IndexInt pd=0; pd<(IndexInt)mPdataInt .size(); ++pd) mPdataInt [pd]->copyValue(nextRead, i);
+			mData[nextRead].flag = PINVALID;
+		}
+	}
+	if(nextRead<(IndexInt)mData.size()) debMsg("Deleted "<<((IndexInt)mData.size() - nextRead)<<" particles", 1); // debug info
+
+	resizeAll(nextRead);
+	mDeletes = 0;
+	mDeleteChunk = mData.size() / DELETE_PART;
+}
+
+//! insert buffered positions as new particles, update additional particle data
+template<class S>
+void ParticleSystem<S>::insertBufferedParticles() {
+	// clear new flag everywhere
+	for(IndexInt i=0; i<(IndexInt)mData.size(); ++i) mData[i].flag &= ~PNEW;
+
+	if(mNewBufferPos.size()==0) return;
+	IndexInt newCnt = mData.size();
+	resizeAll(newCnt + mNewBufferPos.size());
+
+	for(IndexInt i=0; i<(IndexInt)mNewBufferPos.size(); ++i) {
+		int flag = (mNewBufferFlag.size() > 0) ? mNewBufferFlag[i] : 0;
+		// note, other fields are not initialized here...
+		mData[newCnt].pos  = mNewBufferPos[i];
+		mData[newCnt].flag = PNEW | flag;
+		// now init pdata fields from associated grids...
+		for(IndexInt pd=0; pd<(IndexInt)mPdataReal.size(); ++pd) 
+			mPdataReal[pd]->initNewValue(newCnt, mNewBufferPos[i] );
+		for(IndexInt pd=0; pd<(IndexInt)mPdataVec3.size(); ++pd) 
+			mPdataVec3[pd]->initNewValue(newCnt, mNewBufferPos[i] );
+		for(IndexInt pd=0; pd<(IndexInt)mPdataInt.size(); ++pd) 
+			mPdataInt[pd]->initNewValue(newCnt, mNewBufferPos[i] );
+		newCnt++;
+	}
+	if(mNewBufferPos.size()>0) debMsg("Added & initialized "<<(IndexInt)mNewBufferPos.size()<<" particles", 2); // debug info
+	mNewBufferPos.clear();
+	mNewBufferFlag.clear();
+}
+
+
+template<class DATA, class CON>
+void ConnectedParticleSystem<DATA,CON>::compress() {
+	const IndexInt sz = ParticleSystem<DATA>::size();
+	IndexInt *renumber_back = new IndexInt[sz];
+	IndexInt *renumber = new IndexInt[sz];
+	for (IndexInt i=0; i<sz; i++)
+		renumber[i] = renumber_back[i] = -1;
+		
+	// reorder elements
+	std::vector<DATA>& data = ParticleSystem<DATA>::mData;
+	IndexInt nextRead = sz;
+	for (IndexInt i=0; i<nextRead; i++) {
+		if ((data[i].flag & ParticleBase::PDELETE) != 0) {
+			nextRead--;
+			data[i] = data[nextRead];
+			data[nextRead].flag = 0;           
+			renumber_back[i] = nextRead;
+		} else 
+			renumber_back[i] = i;
+	}
+	
+	// acceleration structure
+	for (IndexInt i=0; i<nextRead; i++)
+		renumber[renumber_back[i]] = i;
+	
+	// rename indices in filaments
+	for (IndexInt i=0; i<(IndexInt)mSegments.size(); i++)
+		mSegments[i].renumber(renumber);
+		
+	ParticleSystem<DATA>::mData.resize(nextRead);
+	ParticleSystem<DATA>::mDeletes = 0;
+	ParticleSystem<DATA>::mDeleteChunk = ParticleSystem<DATA>::size() / DELETE_PART;
+	
+	delete[] renumber;
+	delete[] renumber_back;
+}
+
+template<class S>
+ParticleBase* ParticleSystem<S>::clone() {
+	ParticleSystem<S>* nm = new ParticleSystem<S>(getParent());
+	if(this->mAllowCompress) compress();
+	
+	nm->mData = mData;
+	nm->setName(getName());
+	this->cloneParticleData(nm);
+	return nm;
+}
+
+template<class DATA,class CON>
+ParticleBase* ConnectedParticleSystem<DATA,CON>::clone() {
+	ConnectedParticleSystem<DATA,CON>* nm = new ConnectedParticleSystem<DATA,CON>(this->getParent());
+	if(this->mAllowCompress) compress();
+	
+	nm->mData = this->mData;
+	nm->mSegments = mSegments;
+	nm->setName(this->getName());
+	this->cloneParticleData(nm);
+	return nm;
+}
+
+template<class S>  
+std::string ParticleSystem<S>::infoString() const { 
+	std::stringstream s;
+	s << "ParticleSys '" << getName() << "'\n-> ";
+	if(this->getNumPdata()>0) s<< "pdata: "<< this->getNumPdata();
+	s << "parts: " << size();
+	//for(IndexInt i=0; i<(IndexInt)mPartData.size(); ++i) { sstr << i<<":" << mPartData[i]->size() <<" "; }
+	return s.str();
+}
+	
+template<class S>  
+inline void ParticleSystem<S>::checkPartIndex(IndexInt idx) const {
+	IndexInt mySize = this->size();
+	if (idx<0 || idx > mySize ) {
+		errMsg( "ParticleBase " << " size " << mySize << " : index " << idx << " out of bound " );
+	}
+}
+	
+inline void ParticleDataBase::checkPartIndex(IndexInt idx) const {
+	IndexInt mySize = this->getSizeSlow();
+	if (idx<0 || idx > mySize ) {
+		errMsg( "ParticleData " << " size " << mySize << " : index " << idx << " out of bound " );
+	}
+	if ( mpParticleSys && mpParticleSys->getSizeSlow()!=mySize ) {
+		errMsg( "ParticleData " << " size " << mySize << " does not match parent! (" << mpParticleSys->getSizeSlow() << ") " );
+	}
+}
+
+// set contents to zero, as for a grid
+template<class T>
+void ParticleDataImpl<T>::clear() {
+	for(IndexInt i=0; i<(IndexInt)mData.size(); ++i) mData[i] = 0.;
+}
+
+template class ParticleSystem<BasicParticleData>;
+template class ParticleSystem<TurbulenceParticleData>;
+template class ParticleSystem<VortexParticleData>;
 } // namespace
