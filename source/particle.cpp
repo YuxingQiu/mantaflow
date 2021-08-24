@@ -681,10 +681,10 @@ template class ParticleDataImpl<Vec3>;
 
 const int DELETE_PART = 20; // chunk size for compression
 
-void ParticleBase::addBuffered(const Vec3& pos, int flag) {
-	mNewBufferPos.push_back(pos);
-	mNewBufferFlag.push_back(flag);
-}
+// void ParticleBase::addBuffered(const Vec3& pos, int flag) {
+// 	mNewBufferPos.push_back(pos);
+// 	mNewBufferFlag.push_back(flag);
+// }
    
 template<class S>
 void ParticleSystem<S>::clear() {
@@ -1024,13 +1024,8 @@ inline void ParticleDataBase::checkPartIndex(IndexInt idx) const {
 	}
 }
 
-// set contents to zero, as for a grid
-template<class T>
-void ParticleDataImpl<T>::clear() {
-	for(IndexInt i=0; i<(IndexInt)mData.size(); ++i) mData[i] = 0.;
-}
-
 template class ParticleSystem<BasicParticleData>;
 template class ParticleSystem<TurbulenceParticleData>;
 template class ParticleSystem<VortexParticleData>;
+template class ParticleSystem<ParticleIndexData>;
 } // namespace

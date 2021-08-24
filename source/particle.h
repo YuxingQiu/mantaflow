@@ -56,7 +56,11 @@ public:
 	virtual IndexInt getSizeSlow() const { assertMsg( false , "Dont use, override..."); return 0; }
 
 	//! add a position as potential candidate for new particle (todo, make usable from parallel threads)
-	inline void addBuffered(const Vec3& pos, int flag=0);
+	// inline void addBuffered(const Vec3& pos, int flag=0);
+    inline void addBuffered(const Vec3& pos, int flag=0) {
+	    mNewBufferPos.push_back(pos);
+	    mNewBufferFlag.push_back(flag);
+    }
 
 	//! particle data functions
 
@@ -391,7 +395,11 @@ PYTHON() alias ParticleDataImpl<Vec3> PdataVec3;
 
 //! count by type flag
 int countParticles(const ParticleDataImpl<int> &t, const int flag);
-
+// set contents to zero, as for a grid
+template<class T>
+void ParticleDataImpl<T>::clear() {
+	for(IndexInt i=0; i<(IndexInt)mData.size(); ++i) mData[i] = 0.;
+}
 } // namespace
 
 #endif
