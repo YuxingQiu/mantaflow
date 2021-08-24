@@ -730,7 +730,7 @@ void ParticleSystem<S>::transformPositions( Vec3i dimOld, Vec3i dimNew )
 }
 
 // check for deletion/invalid position, otherwise return velocity
-KERNEL(pts) returns(std::vector<Vec3> u) template<class S>
+KERNEL(pts) returns(std::vector<Vec3> u(size)) template<class S>
 std::vector<Vec3> GridAdvectKernel(
 	std::vector<S>& p, const MACGrid& vel, const FlagGrid& flags, const Real dt,
 	const bool deleteInObstacle, const bool stopInObstacle, const bool skipNew,
