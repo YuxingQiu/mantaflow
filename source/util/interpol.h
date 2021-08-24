@@ -127,8 +127,10 @@ inline void setInterpol(T* data, const Vec3i& size, const int Z, const Vec3& pos
 inline Vec3 interpolMAC(const Vec3* data, const Vec3i& size, const int Z, const Vec3& pos) 
 {
 	BUILD_INDEX_SHIFT;
-	DEBUG_ONLY(checkIndexInterpol(size, (zi*(IndexInt)size.y + yi)*(IndexInt)size.x + xi));
-	DEBUG_ONLY(checkIndexInterpol(size, (s_zi*(IndexInt)size.y + s_yi)*(IndexInt)size.x + s_xi + X + Y + Z));
+	// DEBUG_ONLY(checkIndexInterpol(size, (zi*(IndexInt)size.y + yi)*(IndexInt)size.x + xi));
+	// DEBUG_ONLY(checkIndexInterpol(size, (s_zi*(IndexInt)size.y + s_yi)*(IndexInt)size.x + s_xi + X + Y + Z));
+	checkIndexInterpol(size, (zi*(IndexInt)size.y + yi)*(IndexInt)size.x + xi);
+    checkIndexInterpol(size, (s_zi*(IndexInt)size.y + s_yi)*(IndexInt)size.x + s_xi + X + Y + Z);
     
     // process individual components
     Vec3 ret(0.);
